@@ -1,0 +1,17 @@
+{
+  "name": "おのざき イベントレジ",
+  "short_name": "イベントレジ",
+  "description": "野外イベント用のオフライン対応レジ。圏外でも会計でき、電波が戻ったらkintoneへ送信します。",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#FAFBFD",
+  "theme_color": "#1B4F72",
+  "lang": "ja",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
