@@ -1,13 +1,14 @@
 /**
  * おのざき イベントレジ（オフラインPWA）
  *
- * 電波ゼロの野外イベントでレジを打つための独立アプリ。
+ * 野外イベント用。**通信が要るのは送信のときだけ**。
  * - アプリ本体は Service Worker がキャッシュ → 圏外でも起動する
- * - 会計データは IndexedDB に保存 → 圏外でも失われない
- * - 電波が戻ったら中継サーバ経由で社内システムへ送信する
+ * - 商品は端末内のマスタで持つ → 事前の取り込みなしでレジを打てる
+ * - 会計は IndexedDB に貯める → 圏外でも消えない
+ * - 電波のあるところで、どのイベントの売上かを選んで送信する
  *
- * 送信先URLと合言葉はこのソースには持たせない。端末登録時に「接続コード」
- * として受け取り、その端末のローカルにだけ保存する。
+ * 送信先URLと合言葉はこのソースには持たせない。端末登録時に「接続コード」として
+ * 受け取り、その端末のローカルにだけ保存する。
  * したがってこのページを第三者が開いても、接続コードが無ければ何もできない。
  */
 (function () {
@@ -17,7 +18,7 @@
   //  IndexedDB
   // ─────────────────────────────────────────────
   var DB_NAME = 'onozaki-event-pos';
-  var DB_VER = 1;
+  var DB_VER = 2;
   var db = null;
 
   function openDb() {
@@ -26,25 +27,26 @@
       req.onupgradeneeded = function (e) {
         var d = e.target.result;
         if (!d.objectStoreNames.contains('config')) d.createObjectStore('config');
-        if (!d.objectStoreNames.contains('events')) d.createObjectStore('events', { keyPath: 'eventNo' });
         if (!d.objectStoreNames.contains('txns')) {
           var s = d.createObjectStore('txns', { keyPath: 'clientTxnId' });
           s.createIndex('synced', 'synced');
-          s.createIndex('eventNo', 'eventNo');
         }
+        // v2: 商品マスタを端末に持つようにした。イベントの先読みはやめたので events は捨てる。
+        if (!d.objectStoreNames.contains('products')) d.createObjectStore('products', { keyPath: 'id' });
+        if (d.objectStoreNames.contains('events')) d.deleteObjectStore('events');
       };
       req.onsuccess = function () { db = req.result; resolve(db); };
       req.onerror = function () { reject(req.error); };
     });
   }
 
-  function tx(store, mode) { return db.transaction(store, mode).objectStore(store); }
   function wrap(req) {
     return new Promise(function (res, rej) {
       req.onsuccess = function () { res(req.result); };
       req.onerror = function () { rej(req.error); };
     });
   }
+  function tx(store, mode) { return db.transaction(store, mode).objectStore(store); }
   function dbGet(store, key) { return wrap(tx(store, 'readonly').get(key)); }
   function dbPut(store, val, key) { return wrap(tx(store, 'readwrite').put(val, key)); }
   function dbAll(store) { return wrap(tx(store, 'readonly').getAll()); }
@@ -54,10 +56,11 @@
   // ─────────────────────────────────────────────
   //  状態
   // ─────────────────────────────────────────────
-  var cfg = null;          // { url, secret, deviceName }
-  var evt = null;          // 選択中イベント
-  var cart = {};           // { 商品index: 個数 }
-  var syncing = false;
+  var cfg = null;        // { url, secret, deviceName }
+  var products = [];     // 端末内の商品マスタ
+  var cart = {};         // { 商品id: 個数 }
+  var dailyTarget = 0;
+  var sending = false;
 
   // ─────────────────────────────────────────────
   //  ユーティリティ
@@ -70,7 +73,7 @@
   }
   function yen(n) { return '¥' + Math.round(n || 0).toLocaleString('ja-JP'); }
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
-  function todayStr(d) {
+  function dateStr(d) {
     d = d || new Date();
     return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
   }
@@ -78,8 +81,7 @@
     if (crypto.randomUUID) return crypto.randomUUID();
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
       var r = crypto.getRandomValues(new Uint8Array(1))[0] % 16;
-      var v = c === 'x' ? r : (r & 0x3 | 0x8);
-      return v.toString(16);
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
     });
   }
   var toastTimer = null;
@@ -91,22 +93,21 @@
     toastTimer = setTimeout(function () { t.className = ''; }, isErr ? 5000 : 2600);
   }
 
-  function show(screenId) {
-    ['s-setup', 's-events', 's-reg', 's-menu'].forEach(function (id) {
-      $(id).classList.toggle('active', id === screenId);
-    });
+  var SCREENS = ['s-setup', 's-reg', 's-prod', 's-send', 's-menu'];
+  function show(id) {
+    SCREENS.forEach(function (s) { $(s).classList.toggle('active', s === id); });
     $('pay').style.display = 'none';
-    $('btn-menu').style.display = (screenId === 's-setup') ? 'none' : '';
-    $('btn-menu').textContent = (screenId === 's-menu') ? '閉じる' : 'メニュー';
+    $('btn-menu').style.display = (id === 's-setup') ? 'none' : '';
+    $('btn-menu').textContent = (id === 's-reg') ? 'メニュー' : 'レジに戻る';
   }
 
   // ─────────────────────────────────────────────
-  //  通信（GAS中継）
+  //  通信（中継サーバ経由）
   // ─────────────────────────────────────────────
-  function callGas(action, payload) {
+  function callRelay(action, payload) {
     if (!cfg) return Promise.reject(new Error('端末が未登録です'));
     var body = Object.assign({ secret: cfg.secret, action: action }, payload || {});
-    // GASのWeb Appはプリフライトを避けるため text/plain で送る
+    // プリフライトを避けるため text/plain で送る
     return fetch(cfg.url, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
@@ -121,13 +122,9 @@
     });
   }
 
-  // ─────────────────────────────────────────────
-  //  ネットワーク表示
-  // ─────────────────────────────────────────────
   function renderNet() {
     var on = navigator.onLine;
-    var c = $('chip-net');
-    c.className = 'chip ' + (on ? 'chip-on' : 'chip-off');
+    $('chip-net').className = 'chip ' + (on ? 'chip-on' : 'chip-off');
     $('chip-net-t').textContent = on ? 'オンライン' : 'オフライン';
   }
 
@@ -140,12 +137,8 @@
   function renderPending() {
     return pendingTxns().then(function (p) {
       var c = $('chip-pending');
-      if (p.length) {
-        c.style.display = '';
-        c.textContent = '未送信 ' + p.length + '件';
-      } else {
-        c.style.display = 'none';
-      }
+      if (p.length) { c.style.display = ''; c.textContent = '未送信 ' + p.length + '件'; }
+      else c.style.display = 'none';
       return p;
     });
   }
@@ -169,164 +162,164 @@
     var tmp = { url: parsed.url, secret: parsed.secret, deviceName: parsed.deviceName || 'iPad' };
     var prev = cfg;
     cfg = tmp;
-    callGas('ping', {}).then(function () {
+    callRelay('ping', {}).then(function () {
       return dbPut('config', tmp, 'main');
     }).then(function () {
       $('setup-msg').textContent = '';
       toast('この端末を登録しました');
-      gotoEvents();
+      gotoRegister();
     }).catch(function (err) {
       cfg = prev;
       $('setup-msg').textContent = '登録できませんでした: ' + err.message;
     });
   }
 
-  function initSetup() {
-    $('setup-go').onclick = function () {
-      var raw = $('setup-code').value.trim();
-      if (raw) applySetupCode(raw);
-    };
-  }
-
   /**
    * URLの #setup=... で渡された接続コードを拾う。
-   * iPadで長い文字列を手入力せずに済むよう、リンクを開くだけで登録できるようにする。
-   * 拾ったらすぐURLから消して、履歴や共有に合言葉が残らないようにする。
+   * QRを読むだけで登録できるようにするため。拾ったらすぐURLから消して、
+   * 履歴や共有に合言葉が残らないようにする。
    */
   function consumeSetupHash() {
     var m = /[#&]setup=([^&]+)/.exec(location.hash || '');
     if (!m) return null;
     var code = decodeURIComponent(m[1]);
-    try {
-      history.replaceState(null, '', location.pathname + location.search);
-    } catch (e) {
-      location.hash = '';
-    }
+    try { history.replaceState(null, '', location.pathname + location.search); }
+    catch (e) { location.hash = ''; }
     return code;
   }
 
   // ─────────────────────────────────────────────
-  //  ② イベント選択・取り込み
+  //  ② 商品マスタ（オフラインで編集できる）
   // ─────────────────────────────────────────────
-  function gotoEvents() {
-    show('s-events');
-    $('hdr-title').textContent = 'イベントレジ';
-    renderEventList();
+  function loadProducts() {
+    return dbAll('products').then(function (list) {
+      list.sort(function (a, b) { return (a.sort || 0) - (b.sort || 0); });
+      products = list;
+      return products;
+    });
   }
 
-  function renderEventList() {
-    return dbAll('events').then(function (list) {
-      var wrap = $('ev-list');
-      if (!list.length) {
-        wrap.innerHTML = '<div style="padding:28px;text-align:center;color:#888;font-size:14px;line-height:1.8;">'
-          + 'まだイベントが取り込まれていません。<br>電波のあるところで上の「kintoneから取り込む」を押してください。</div>';
-        return;
-      }
-      list.sort(function (a, b) { return (b.startDate || '').localeCompare(a.startDate || ''); });
-      wrap.innerHTML = list.map(function (e) {
-        var period = e.startDate === e.endDate ? e.startDate : (e.startDate + ' 〜 ' + e.endDate);
-        return '<div class="ev-row">'
-          + '<div style="flex:1;min-width:0;">'
-          + '  <div style="font-weight:bold;color:#1B4F72;font-size:15px;">' + esc(e.eventName) + '</div>'
-          + '  <div class="muted">' + esc(period) + '　' + esc(e.accountDept || '') + '　商品' + e.products.length + '件</div>'
-          + '</div>'
-          + '<button class="btn btn-accent" data-open="' + e.eventNo + '" style="padding:10px 18px;font-size:14px;">レジを開く</button>'
-          + '</div>';
-      }).join('');
-      Array.prototype.forEach.call(wrap.querySelectorAll('[data-open]'), function (b) {
-        b.onclick = function () { openRegister(parseInt(b.dataset.open, 10)); };
+  function gotoProducts() {
+    show('s-prod');
+    $('hdr-title').textContent = '商品の登録';
+    renderProdList();
+  }
+
+  function renderProdList() {
+    var el = $('prod-list');
+    if (!products.length) {
+      el.innerHTML = '<div class="muted" style="padding:26px;text-align:center;line-height:1.8;">'
+        + 'まだ商品がありません。<br>上のフォームから追加してください。</div>';
+      return;
+    }
+    el.innerHTML = products.map(function (p, i) {
+      return '<div class="row">'
+        + '<button class="qbtn" data-up="' + p.id + '"' + (i === 0 ? ' disabled style="opacity:.3;"' : '') + '>↑</button>'
+        + '<div style="flex:1;min-width:0;">'
+        + '  <div style="font-weight:bold;color:#1B4F72;">' + esc(p.name) + '</div>'
+        + '  <div class="muted num">' + yen(p.price) + '　税率 ' + esc(p.tax) + '</div>'
+        + '</div>'
+        + '<button class="btn btn-light" data-del="' + p.id + '" style="padding:8px 14px;font-size:13px;color:#B8432D;border-color:#F3C9BE;">削除</button>'
+        + '</div>';
+    }).join('');
+
+    Array.prototype.forEach.call(el.querySelectorAll('[data-del]'), function (b) {
+      b.onclick = function () {
+        var p = products.filter(function (x) { return x.id === b.dataset.del; })[0];
+        if (!p || !confirm('「' + p.name + '」を削除しますか？\n（送信済み・未送信の会計データはそのまま残ります）')) return;
+        dbDel('products', p.id).then(loadProducts).then(function () {
+          renderProdList();
+          toast('削除しました');
+        });
+      };
+    });
+    Array.prototype.forEach.call(el.querySelectorAll('[data-up]'), function (b) {
+      b.onclick = function () {
+        var i = products.findIndex(function (x) { return x.id === b.dataset.up; });
+        if (i <= 0) return;
+        var a = products[i - 1], c = products[i];
+        var s = a.sort; a.sort = c.sort; c.sort = s;
+        Promise.all([dbPut('products', a), dbPut('products', c)])
+          .then(loadProducts).then(renderProdList);
+      };
+    });
+  }
+
+  function addProduct() {
+    var name = $('np-name').value.trim();
+    var price = parseFloat($('np-price').value);
+    var tax = $('np-tax').value;
+    if (!name) { toast('商品名を入れてください', true); return; }
+    if (!(price >= 0)) { toast('売価を入れてください', true); return; }
+    if (products.some(function (p) { return p.name === name; })) {
+      toast('同じ名前の商品がすでにあります', true); return;
+    }
+    var maxSort = products.reduce(function (m, p) { return Math.max(m, p.sort || 0); }, 0);
+    dbPut('products', { id: uuid(), name: name, price: Math.round(price), tax: tax, sort: maxSort + 1 })
+      .then(loadProducts).then(function () {
+        $('np-name').value = ''; $('np-price').value = '';
+        $('np-name').focus();
+        renderProdList();
+        toast('「' + name + '」を追加しました');
       });
-    });
-  }
-
-  function pullEvents() {
-    if (!navigator.onLine) { toast('オフラインです。電波のある場所で実行してください', true); return; }
-    var btn = $('ev-pull');
-    btn.disabled = true; btn.textContent = '取り込み中…';
-    callGas('events', {}).then(function (res) {
-      // ローカルの累計は取り込み時にサーバー値で上書きする（1台運用が前提）
-      var puts = res.events.map(function (e) { return dbPut('events', e); });
-      return Promise.all(puts).then(function () { return res.events.length; });
-    }).then(function (n) {
-      toast(n + '件のイベントを取り込みました');
-      renderEventList();
-    }).catch(function (err) {
-      toast('取り込み失敗: ' + err.message, true);
-    }).then(function () {
-      btn.disabled = false; btn.textContent = 'kintoneから取り込む';
-    });
   }
 
   // ─────────────────────────────────────────────
   //  ③ レジ
   // ─────────────────────────────────────────────
-  function openRegister(eventNo) {
-    return dbGet('events', eventNo).then(function (e) {
-      if (!e) { toast('イベントが見つかりません', true); return; }
-      evt = e;
-      cart = {};
-      dbPut('config', eventNo, 'currentEvent');
-      show('s-reg');
-      $('hdr-title').textContent = e.eventName;
-      renderProducts();
-      renderCart();
-      renderTotals();
-    });
+  function gotoRegister() {
+    show('s-reg');
+    $('hdr-title').textContent = 'おのざき イベントレジ';
+    renderProductButtons();
+    renderCart();
+    renderTotals();
   }
 
-  /** 当日分の商品だけ出す。当日分が無ければ全商品にフォールバック（kintone側レジと同じ挙動）。 */
-  function visibleProducts() {
-    var today = todayStr();
-    var idxs = evt.products.map(function (p, i) { return i; });
-    var dated = idxs.filter(function (i) { return evt.products[i].date; });
-    var todays = idxs.filter(function (i) {
-      var d = evt.products[i].date || '';
-      return d === '' || d === today;
-    });
-    if (dated.length && !todays.some(function (i) { return evt.products[i].date === today; })) return idxs;
-    return todays;
-  }
-
-  function renderProducts() {
+  function renderProductButtons() {
     var grid = $('prod-grid');
     grid.innerHTML = '';
-    var vis = visibleProducts();
-    if (!vis.length) {
-      grid.innerHTML = '<div class="muted" style="padding:20px;">商品が登録されていません。</div>';
+    if (!products.length) {
+      grid.innerHTML = '<div class="card" style="grid-column:1/-1;text-align:center;padding:30px;">'
+        + '<div class="muted" style="line-height:1.8;margin-bottom:14px;">商品がまだ登録されていません。<br>電波が無くてもここで登録できます。</div>'
+        + '<button class="btn btn-primary" id="empty-add">商品を登録する</button></div>';
+      $('empty-add').onclick = gotoProducts;
       return;
     }
-    vis.forEach(function (i) {
-      var p = evt.products[i];
+    products.forEach(function (p) {
       var b = document.createElement('button');
       b.className = 'prod';
-      b.innerHTML = '<div class="prod-name">' + esc(p.name)
-        + (p.date ? '<span style="font-size:10px;color:#888;font-weight:normal;"> ' + esc(p.date.slice(5)) + '</span>' : '')
-        + '</div>'
-        + '<div class="prod-price num">' + yen(p.price) + '</div>'
-        + '<div class="prod-qty num">累計 ' + (p.actualQty || 0) + '個</div>';
-      b.onclick = function () { cart[i] = (cart[i] || 0) + 1; renderCart(); };
+      b.innerHTML = '<div class="prod-name">' + esc(p.name) + '</div>'
+        + '<div class="prod-price num">' + yen(p.price) + '</div>';
+      b.onclick = function () { cart[p.id] = (cart[p.id] || 0) + 1; renderCart(); };
       grid.appendChild(b);
     });
   }
 
+  function prodById(id) {
+    return products.filter(function (p) { return p.id === id; })[0];
+  }
+
   function cartTotal() {
-    return Object.keys(cart).reduce(function (s, i) { return s + evt.products[i].price * cart[i]; }, 0);
+    return Object.keys(cart).reduce(function (s, id) {
+      var p = prodById(id);
+      return s + (p ? p.price * cart[id] : 0);
+    }, 0);
   }
 
   function renderCart() {
-    var keys = Object.keys(cart).filter(function (i) { return cart[i] > 0; });
+    var keys = Object.keys(cart).filter(function (id) { return cart[id] > 0 && prodById(id); });
     var list = $('cart-list');
     if (!keys.length) {
       list.innerHTML = '<div class="muted" style="text-align:center;padding:18px;">商品をタップしてください</div>';
     } else {
-      list.innerHTML = keys.map(function (i) {
-        var p = evt.products[i];
+      list.innerHTML = keys.map(function (id) {
+        var p = prodById(id);
         return '<div class="cart-row">'
           + '<span class="cart-name">' + esc(p.name) + '</span>'
-          + '<button class="qbtn" data-dec="' + i + '">−</button>'
-          + '<span class="num" style="min-width:26px;text-align:center;font-weight:bold;">' + cart[i] + '</span>'
-          + '<button class="qbtn" data-inc="' + i + '">+</button>'
-          + '<span class="num" style="min-width:70px;text-align:right;">' + yen(p.price * cart[i]) + '</span>'
+          + '<button class="qbtn" data-dec="' + id + '">−</button>'
+          + '<span class="num" style="min-width:26px;text-align:center;font-weight:bold;">' + cart[id] + '</span>'
+          + '<button class="qbtn" data-inc="' + id + '">+</button>'
+          + '<span class="num" style="min-width:70px;text-align:right;">' + yen(p.price * cart[id]) + '</span>'
           + '</div>';
       }).join('');
       Array.prototype.forEach.call(list.querySelectorAll('[data-inc]'), function (b) {
@@ -334,8 +327,8 @@
       });
       Array.prototype.forEach.call(list.querySelectorAll('[data-dec]'), function (b) {
         b.onclick = function () {
-          var i = b.dataset.dec;
-          cart[i]--; if (cart[i] <= 0) delete cart[i];
+          var id = b.dataset.dec;
+          cart[id]--; if (cart[id] <= 0) delete cart[id];
           renderCart();
         };
       });
@@ -346,47 +339,39 @@
     $('pay-paypay').disabled = (t <= 0);
   }
 
-  function todayTarget() {
-    var today = todayStr(), t = 0;
-    evt.products.forEach(function (p) {
-      if (p.date === today) t += p.price * (parseFloat(p.budgetQty) || 0);
+  /** 本日ぶんの売上を、端末に残っている会計から数える。 */
+  function todayStats() {
+    var today = dateStr();
+    return dbAll('txns').then(function (all) {
+      var mine = all.filter(function (t) { return t.businessDate === today; });
+      var cash = 0, paypay = 0, count = 0;
+      mine.forEach(function (t) {
+        if (t.method === 'cash') cash += t.total; else paypay += t.total;
+        count++;
+      });
+      return { cash: cash, paypay: paypay, total: cash + paypay, count: count };
     });
-    if (t === 0) {
-      (evt.dailyBudget || []).forEach(function (d) { if (d.date === today) t += parseFloat(d.target) || 0; });
-    }
-    return Math.round(t);
   }
 
   function renderTotals() {
-    var achieved = (evt.cash || 0) + (evt.paypay || 0);
-    var budget = parseFloat(evt.budgetSales) || 0;
-    var tt = todayTarget();
-    var ta = evt.todayAchieved && evt.todayAchievedDate === todayStr() ? evt.todayAchieved : 0;
-    var html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">'
-      + '<div class="kpi"><div class="kpi-label">現金 累計</div><div class="kpi-value num" style="font-size:16px;">' + yen(evt.cash) + '</div></div>'
-      + '<div class="kpi"><div class="kpi-label">PayPay 累計</div><div class="kpi-value num" style="font-size:16px;">' + yen(evt.paypay) + '</div></div>'
-      + '</div>'
-      + '<div class="kpi" style="margin-top:8px;"><div class="kpi-label">売上 累計</div><div class="kpi-value num" style="color:#D4573B;">' + yen(achieved) + '</div></div>';
-    if (tt > 0) {
-      var r = ta / tt * 100;
-      html += '<div class="card" style="margin-top:8px;border-color:#1B4F72;">'
-        + '<div style="display:flex;justify-content:space-between;font-size:12px;color:#666;margin-bottom:6px;">'
-        + '<span style="font-weight:bold;color:#1B4F72;">本日の達成率</span><span class="num">目標 ' + yen(tt) + '</span></div>'
-        + '<div class="track"><div class="fill" style="width:' + Math.min(100, r) + '%;' + (r >= 100 ? 'background:linear-gradient(90deg,#1B5E20,#2E8B57);' : '') + '"></div></div>'
-        + '<div class="num" style="text-align:right;font-size:22px;font-weight:bold;margin-top:6px;color:' + (r >= 100 ? '#1B5E20' : '#1B4F72') + ';">' + r.toFixed(1) + '%</div>'
-        + '</div>';
-    }
-    if (budget > 0) {
-      var br = achieved / budget * 100;
-      html += '<div class="card" style="margin-top:8px;">'
-        + '<div style="display:flex;justify-content:space-between;font-size:12px;color:#666;margin-bottom:6px;">'
-        + '<span style="font-weight:bold;">予算達成率</span><span class="num">予算 ' + yen(budget) + '</span></div>'
-        + '<div class="track"><div class="fill" style="width:' + Math.min(100, br) + '%;' + (br >= 100 ? 'background:linear-gradient(90deg,#1B5E20,#2E8B57);' : '') + '"></div></div>'
-        + '<div class="num" style="text-align:right;font-size:22px;font-weight:bold;margin-top:6px;color:' + (br >= 100 ? '#1B5E20' : '#1B4F72') + ';">' + br.toFixed(1) + '%'
-        + '<span class="muted" style="font-weight:normal;"> （残り ' + yen(Math.max(0, budget - achieved)) + '）</span></div>'
-        + '</div>';
-    }
-    $('reg-totals').innerHTML = html;
+    return todayStats().then(function (s) {
+      var html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">'
+        + '<div class="kpi"><div class="kpi-label">本日 現金</div><div class="kpi-value num" style="font-size:16px;">' + yen(s.cash) + '</div></div>'
+        + '<div class="kpi"><div class="kpi-label">本日 PayPay</div><div class="kpi-value num" style="font-size:16px;">' + yen(s.paypay) + '</div></div>'
+        + '</div>'
+        + '<div class="kpi" style="margin-top:8px;"><div class="kpi-label">本日の売上（' + s.count + '会計）</div>'
+        + '<div class="kpi-value num" style="color:#D4573B;">' + yen(s.total) + '</div></div>';
+      if (dailyTarget > 0) {
+        var r = s.total / dailyTarget * 100;
+        html += '<div class="card" style="margin-top:8px;border-color:#1B4F72;">'
+          + '<div style="display:flex;justify-content:space-between;font-size:12px;color:#666;margin-bottom:6px;">'
+          + '<span style="font-weight:bold;color:#1B4F72;">本日の達成率</span><span class="num">目標 ' + yen(dailyTarget) + '</span></div>'
+          + '<div class="track"><div class="fill" style="width:' + Math.min(100, r) + '%;' + (r >= 100 ? 'background:linear-gradient(90deg,#1B5E20,#2E8B57);' : '') + '"></div></div>'
+          + '<div class="num" style="text-align:right;font-size:22px;font-weight:bold;margin-top:6px;color:' + (r >= 100 ? '#1B5E20' : '#1B4F72') + ';">' + r.toFixed(1) + '%</div>'
+          + '</div>';
+      }
+      $('reg-totals').innerHTML = html;
+    });
   }
 
   // ─────────────────────────────────────────────
@@ -424,7 +409,7 @@
       var recvEl = pay.querySelector('[data-recv]');
       var chEl = pay.querySelector('[data-change]');
       var okBtn = pay.querySelector('[data-ok]');
-      function refresh() {
+      var refresh = function () {
         var recv = parseFloat(recvStr || 0);
         recvEl.textContent = yen(recv);
         var ch = recv - amt;
@@ -432,7 +417,7 @@
         else { chEl.textContent = yen(ch > 0 ? ch : 0); chEl.style.color = '#1B5E20'; }
         okBtn.disabled = (recv < amt);
         okBtn.textContent = (recv >= amt) ? ('会計確定（お釣り ' + yen(ch) + '）') : '会計確定';
-      }
+      };
       var kp = pay.querySelector('#keypad');
       ['7', '8', '9', '4', '5', '6', '1', '2', '3', '0', '00', 'C'].forEach(function (k) {
         var b = document.createElement('button');
@@ -490,127 +475,230 @@
     $('s-reg').classList.add('active');
   }
 
-  /** 会計確定。まず端末内に保存し、オンラインなら裏で送信する。 */
+  /** 会計確定。端末内に保存するだけで、通信はしない。 */
   function finalize(method, amt, cashInfo) {
-    var items = Object.keys(cart).filter(function (i) { return cart[i] > 0; }).map(function (i) {
-      var p = evt.products[i];
-      // date も一緒に送る。kintone側で商品明細の行を突き合わせるのに使う
-      return { idx: parseInt(i, 10), name: p.name, price: p.price, qty: cart[i], tax: p.tax || '8%', date: p.date || '' };
-    });
+    var items = Object.keys(cart).filter(function (id) { return cart[id] > 0 && prodById(id); })
+      .map(function (id) {
+        var p = prodById(id);
+        return { name: p.name, price: p.price, qty: cart[id], tax: p.tax || '8%' };
+      });
     var t8 = 0, t10 = 0;
     items.forEach(function (it) {
       var a = it.price * it.qty;
       if (it.tax === '10%') t10 += a; else t8 += a;
     });
+    var now = new Date();
     var txn = {
       clientTxnId: uuid(),
-      eventNo: evt.eventNo,
-      eventName: evt.eventName,
-      accountDept: evt.accountDept,
+      businessDate: dateStr(now),
       // kintoneのDATETIMEはミリ秒付きを受け付けないので落とす
-      datetime: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      datetime: now.toISOString().replace(/\.\d{3}Z$/, 'Z'),
       method: method,
       total: Math.round(amt),
-      items: items.map(function (it) { return { name: it.name, price: it.price, qty: it.qty, tax: it.tax, date: it.date }; }),
+      items: items,
       tax8Incl: Math.round(t8),
       tax10Incl: Math.round(t10),
       tax8Vat: Math.round(t8 * 8 / 108),
       tax10Vat: Math.round(t10 * 10 / 110),
       cashReceived: cashInfo ? Math.round(cashInfo.received) : null,
       changeAmount: cashInfo ? Math.round(cashInfo.change) : null,
+      eventNo: null,      // どのイベントかは送信するときに決める
       synced: 0
     };
 
-    // ローカル累計を更新（1台運用前提）
-    items.forEach(function (it) { evt.products[it.idx].actualQty = (evt.products[it.idx].actualQty || 0) + it.qty; });
-    if (method === 'cash') evt.cash = (evt.cash || 0) + amt; else evt.paypay = (evt.paypay || 0) + amt;
-    if (evt.todayAchievedDate !== todayStr()) { evt.todayAchievedDate = todayStr(); evt.todayAchieved = 0; }
-    evt.todayAchieved += amt;
-
     dbPut('txns', txn).then(function () {
-      return dbPut('events', evt);
-    }).then(function () {
       cart = {};
       closePay();
-      renderProducts(); renderCart(); renderTotals();
-      toast((method === 'cash' ? '現金' : 'PayPay') + ' ' + yen(amt) + ' を記録しました');
+      renderCart();
+      renderTotals();
       renderPending();
-      trySync(true);
+      toast((method === 'cash' ? '現金' : 'PayPay') + ' ' + yen(amt) + ' を記録しました');
     }).catch(function (err) {
-      // 端末内保存に失敗した場合はローカル累計を巻き戻す
-      items.forEach(function (it) { evt.products[it.idx].actualQty -= it.qty; });
-      if (method === 'cash') evt.cash -= amt; else evt.paypay -= amt;
-      evt.todayAchieved -= amt;
       closePay();
       toast('保存に失敗しました: ' + err.message, true);
     });
   }
 
   // ─────────────────────────────────────────────
-  //  ⑤ 同期
+  //  ⑤ 送信（ここだけ通信が要る）
   // ─────────────────────────────────────────────
-  function trySync(quiet) {
-    if (syncing || !cfg) return Promise.resolve();
-    if (!navigator.onLine) {
-      if (!quiet) toast('オフラインです。電波が戻ってから送信されます', true);
-      return Promise.resolve();
-    }
-    syncing = true;
-    return pendingTxns().then(function (list) {
-      if (!list.length) {
-        if (!quiet) toast('未送信のデータはありません');
+  function gotoSend() {
+    show('s-send');
+    $('hdr-title').textContent = 'kintone に送信';
+    renderSend();
+  }
+
+  function renderSend() {
+    var body = $('send-body');
+    return pendingTxns().then(function (pend) {
+      if (!pend.length) {
+        body.innerHTML = '<div class="card" style="text-align:center;padding:34px;">'
+          + '<div style="font-size:17px;font-weight:bold;color:#1B5E20;margin-bottom:8px;">すべて送信済みです</div>'
+          + '<div class="muted">未送信の会計はありません。</div></div>';
         return;
       }
-      // 一度に送りすぎないよう100件ずつ
-      var batch = list.slice(0, 100);
-      return callGas('sync', { txns: batch }).then(function (res) {
-        var okIds = res.accepted || [];
-        return Promise.all(okIds.map(function (id) {
-          return dbGet('txns', id).then(function (t) {
-            if (!t) return;
-            t.synced = 1; t.syncedAt = new Date().toISOString();
-            return dbPut('txns', t);
+      var sum = pend.reduce(function (s, t) { return s + t.total; }, 0);
+
+      var showOffline = function () {
+        body.innerHTML = '<div class="card" style="text-align:center;padding:30px;">'
+          + '<div style="font-size:17px;font-weight:bold;color:#B8432D;margin-bottom:10px;">まだ電波が届いていません</div>'
+          + '<div class="muted" style="line-height:1.8;">未送信 <b>' + pend.length + '件</b>（' + yen(sum) + '）を預かっています。<br>'
+          + '<b>データは消えません。</b>電波のあるところで、もう一度この画面を開いてください。</div>'
+          + '<button class="btn btn-light" id="send-retry" style="margin-top:16px;">もう一度試す</button></div>';
+        $('send-retry').onclick = renderSend;
+      };
+
+      if (!navigator.onLine) { showOffline(); return; }
+
+      body.innerHTML = '<div class="card" style="text-align:center;padding:24px;">'
+        + '<div class="muted">イベント一覧を読み込んでいます…</div></div>';
+
+      return callRelay('events', {}).then(function (res) {
+        var events = res.events || [];
+        if (!events.length) {
+          body.innerHTML = '<div class="card" style="padding:26px;text-align:center;">'
+            + '<div style="font-weight:bold;color:#B8432D;margin-bottom:8px;">紐づけ先のイベントがありません</div>'
+            + '<div class="muted" style="line-height:1.8;">kintoneの「イベント管理」にイベントを作ってから、もう一度お試しください。</div>'
+            + '<button class="btn btn-light" id="send-retry" style="margin-top:16px;">再読み込み</button></div>';
+          $('send-retry').onclick = renderSend;
+          return;
+        }
+
+        // 日付ごとにまとめる（複数日の売上が溜まっていても、日ごとに別のイベントへ送れる）
+        var groups = {};
+        pend.forEach(function (t) {
+          var d = t.businessDate || (t.datetime || '').slice(0, 10);
+          (groups[d] = groups[d] || []).push(t);
+        });
+        var dates = Object.keys(groups).sort();
+
+        var opts = events.map(function (e) {
+          var period = e.startDate === e.endDate ? e.startDate : (e.startDate + '〜' + e.endDate);
+          return '<option value="' + e.eventNo + '">' + esc(e.eventName) + '（' + esc(period) + '／' + esc(e.accountDept || '') + '）</option>';
+        }).join('');
+
+        body.innerHTML = '<div class="muted" style="margin-bottom:14px;line-height:1.8;">'
+          + '未送信 <b>' + pend.length + '件</b>（合計 ' + yen(sum) + '）があります。<br>'
+          + 'どのイベントの売上として登録するか選んでください。'
+          + '</div>'
+          + dates.map(function (d) {
+            var g = groups[d];
+            var gs = g.reduce(function (s, t) { return s + t.total; }, 0);
+            // 日付に一番近いイベントを初期選択にしておく
+            var best = events.slice().sort(function (a, b) {
+              return Math.abs(new Date(a.startDate) - new Date(d)) - Math.abs(new Date(b.startDate) - new Date(d));
+            })[0];
+            return '<div class="card" style="margin-bottom:12px;">'
+              + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;">'
+              + '  <div style="font-weight:bold;color:#1B4F72;font-size:16px;">' + esc(d) + '</div>'
+              + '  <div class="muted num">' + g.length + '会計 / ' + yen(gs) + '</div>'
+              + '</div>'
+              + '<select class="field" data-date="' + esc(d) + '">' + opts + '</select>'
+              + '<input type="hidden" data-best="' + esc(d) + '" value="' + best.eventNo + '">'
+              + '</div>';
+          }).join('')
+          + '<button class="btn btn-primary" id="send-go" style="width:100%;margin-top:6px;padding:18px;font-size:17px;">この内容で送信する</button>';
+
+        dates.forEach(function (d) {
+          var sel = body.querySelector('[data-date="' + d + '"]');
+          var best = body.querySelector('[data-best="' + d + '"]');
+          if (sel && best) sel.value = best.value;
+        });
+
+        $('send-go').onclick = function () {
+          var plan = dates.map(function (d) {
+            var sel = body.querySelector('[data-date="' + d + '"]');
+            var ev = events.filter(function (e) { return String(e.eventNo) === sel.value; })[0];
+            return { date: d, txns: groups[d], event: ev };
           });
-        })).then(function () {
-          if (!quiet || okIds.length) toast(okIds.length + '件を kintone に送信しました');
-          if (res.failed && res.failed.length) toast(res.failed.length + '件が送れませんでした。あとで再送します', true);
+          doSend(plan);
+        };
+      }).catch(function (err) {
+        // 電波が弱いと navigator.onLine が true のまま通信だけ失敗することがある。
+        // その場合も「圏外」と同じ案内にして、現場で不安にさせない。
+        if (/Failed to fetch|NetworkError|Load failed|通信エラー/i.test(err.message)) { showOffline(); return; }
+        body.innerHTML = '<div class="card" style="padding:26px;text-align:center;">'
+          + '<div style="font-weight:bold;color:#B8432D;margin-bottom:8px;">読み込みに失敗しました</div>'
+          + '<div class="muted" style="line-height:1.8;">' + esc(err.message) + '<br><b>データは端末に残っています。</b></div>'
+          + '<button class="btn btn-light" id="send-retry" style="margin-top:16px;">もう一度</button></div>';
+        $('send-retry').onclick = renderSend;
+      });
+    });
+  }
+
+  function doSend(plan) {
+    if (sending) return;
+    sending = true;
+    var btn = $('send-go');
+    if (btn) { btn.disabled = true; btn.textContent = '送信中…'; }
+
+    var okCount = 0, ngCount = 0, firstErr = null;
+
+    var step = plan.reduce(function (chain, g) {
+      return chain.then(function () {
+        // 送信の直前にイベントを紐づける
+        var txns = g.txns.map(function (t) {
+          return Object.assign({}, t, {
+            eventNo: g.event.eventNo,
+            eventName: g.event.eventName,
+            accountDept: g.event.accountDept
+          });
+        });
+        return callRelay('sync', { txns: txns }).then(function (res) {
+          var accepted = res.accepted || [];
+          return Promise.all(accepted.map(function (id) {
+            return dbGet('txns', id).then(function (t) {
+              if (!t) return;
+              t.synced = 1;
+              t.syncedAt = new Date().toISOString();
+              t.eventNo = g.event.eventNo;
+              t.eventName = g.event.eventName;
+              return dbPut('txns', t);
+            });
+          })).then(function () { okCount += accepted.length; });
+        }).catch(function (err) {
+          ngCount += g.txns.length;
+          if (!firstErr) firstErr = err;
         });
       });
-    }).catch(function (err) {
-      if (!quiet) toast('送信失敗: ' + err.message, true);
-    }).then(function () {
-      syncing = false;
+    }, Promise.resolve());
+
+    step.then(function () {
+      sending = false;
       renderPending();
-      renderMenu();
+      if (okCount) toast(okCount + '件を送信しました');
+      if (ngCount) toast(ngCount + '件が送れませんでした: ' + (firstErr ? firstErr.message : ''), true);
+      renderSend();
     });
   }
 
   // ─────────────────────────────────────────────
   //  ⑥ メニュー
   // ─────────────────────────────────────────────
-  function renderMenu() {
-    if (!$('s-menu').classList.contains('active')) return;
+  function gotoMenu() {
+    show('s-menu');
+    $('hdr-title').textContent = 'メニュー';
+    $('daily-target').value = dailyTarget || '';
+    $('m-prod-sub').textContent = products.length + '品目 ›';
     dbAll('txns').then(function (all) {
       var pend = all.filter(function (t) { return !t.synced; });
-      $('menu-sync-state').innerHTML = pend.length
-        ? '<b style="color:#B8432D;">未送信 ' + pend.length + '件</b>（合計 ' + yen(pend.reduce(function (s, t) { return s + t.total; }, 0)) + '）<br>電波のある場所で送信してください。'
-        : '<b style="color:#1B5E20;">すべて送信済みです。</b>';
+      $('m-send-sub').textContent = pend.length ? ('未送信 ' + pend.length + '件 ›') : 'すべて送信済み ›';
 
-      var today = todayStr();
-      var mine = all.filter(function (t) { return t.datetime.slice(0, 10) === today; })
-        .sort(function (a, b) { return b.datetime.localeCompare(a.datetime); });
+      var today = dateStr();
+      var mine = all.filter(function (t) { return t.businessDate === today; })
+        .sort(function (a, b) { return (b.datetime || '').localeCompare(a.datetime || ''); });
       $('menu-history').innerHTML = mine.length ? mine.map(function (t) {
         var tm = new Date(t.datetime);
         return '<div class="cart-row">'
           + '<span class="num muted" style="min-width:44px;">' + pad2(tm.getHours()) + ':' + pad2(tm.getMinutes()) + '</span>'
-          + '<span class="cart-name">' + esc(t.method === 'cash' ? '現金' : 'PayPay') + '</span>'
+          + '<span class="cart-name">' + (t.method === 'cash' ? '現金' : 'PayPay') + '</span>'
           + '<span class="num" style="min-width:74px;text-align:right;font-weight:bold;">' + yen(t.total) + '</span>'
           + '<span class="chip ' + (t.synced ? 'chip-on' : 'chip-pending') + '" style="font-size:10px;">' + (t.synced ? '送信済' : '未送信') + '</span>'
           + '</div>';
       }).join('') : '<div class="muted" style="padding:16px;text-align:center;">本日の会計はまだありません。</div>';
     });
-    $('menu-device').innerHTML = '接続先: <span style="font-family:monospace;font-size:11px;">' + esc((cfg && cfg.url || '').slice(0, 60)) + '…</span><br>'
-      + '端末名: ' + esc(cfg && cfg.deviceName || '-');
+    $('menu-device').innerHTML = '接続先: <span style="font-family:monospace;font-size:11px;">'
+      + esc((cfg && cfg.url || '').slice(0, 52)) + '…</span><br>端末名: ' + esc(cfg && cfg.deviceName || '-');
   }
 
   // ─────────────────────────────────────────────
@@ -618,59 +706,66 @@
   // ─────────────────────────────────────────────
   function boot() {
     renderNet();
-    initSetup();
 
-    $('ev-pull').onclick = pullEvents;
+    $('setup-go').onclick = function () {
+      var raw = $('setup-code').value.trim();
+      if (raw) applySetupCode(raw);
+    };
+    $('np-add').onclick = addProduct;
+    $('np-price').addEventListener('keydown', function (e) { if (e.key === 'Enter') addProduct(); });
+    $('prod-done').onclick = gotoRegister;
+    $('reg-edit-prod').onclick = gotoProducts;
     $('pay-cash').onclick = function () { openPay('cash'); };
     $('pay-paypay').onclick = function () { openPay('paypay'); };
-    $('menu-sync').onclick = function () { trySync(false); };
-    $('menu-events').onclick = gotoEvents;
+    $('m-send').onclick = gotoSend;
+    $('m-prod').onclick = gotoProducts;
+    $('m-reg').onclick = gotoRegister;
+    $('daily-save').onclick = function () {
+      dailyTarget = Math.max(0, parseFloat($('daily-target').value) || 0);
+      dbPut('config', dailyTarget, 'dailyTarget').then(function () { toast('保存しました'); });
+    };
     $('menu-reset').onclick = function () {
       pendingTxns().then(function (p) {
         var msg = p.length
           ? '未送信の会計が ' + p.length + '件あります。解除すると送信できなくなります。本当に解除しますか？'
-          : '端末登録を解除しますか？（取り込んだイベントと履歴も消えます）';
+          : '端末登録を解除しますか？（商品マスタと履歴も消えます）';
         if (!confirm(msg)) return;
-        Promise.all([dbClear('config'), dbClear('events'), dbClear('txns')]).then(function () {
-          cfg = null; evt = null;
+        Promise.all([dbClear('config'), dbClear('products'), dbClear('txns')]).then(function () {
+          cfg = null; products = []; cart = {}; dailyTarget = 0;
           show('s-setup');
         });
       });
     };
     $('btn-menu').onclick = function () {
-      if ($('s-menu').classList.contains('active')) {
-        show(evt ? 's-reg' : 's-events');
-      } else {
-        show('s-menu');
-        renderMenu();
-      }
+      if ($('s-reg').classList.contains('active')) gotoMenu();
+      else gotoRegister();
     };
 
-    window.addEventListener('online', function () { renderNet(); trySync(true); });
+    window.addEventListener('online', renderNet);
     window.addEventListener('offline', renderNet);
     document.addEventListener('visibilitychange', function () {
-      if (!document.hidden) { renderNet(); trySync(true); }
+      if (!document.hidden) {
+        renderNet();
+        if ($('s-send').classList.contains('active')) renderSend();
+      }
     });
-    // 5分おきに未送信分の再送を試みる
-    setInterval(function () { trySync(true); }, 5 * 60 * 1000);
 
     var hashCode = consumeSetupHash();
 
     return openDb().then(function () {
-      return Promise.all([dbGet('config', 'main'), dbGet('config', 'currentEvent')]);
+      return Promise.all([dbGet('config', 'main'), dbGet('config', 'dailyTarget'), loadProducts()]);
     }).then(function (r) {
       cfg = r[0];
+      dailyTarget = r[1] || 0;
       renderPending();
-      if (hashCode && !cfg) { show('s-setup'); applySetupCode(hashCode); return; }
-      if (!cfg) { show('s-setup'); return; }
-      trySync(true);
-      if (r[1] != null) {
-        return dbGet('events', r[1]).then(function (e) {
-          if (e) return openRegister(r[1]);
-          gotoEvents();
-        });
+      if (!cfg) {
+        show('s-setup');
+        if (hashCode) applySetupCode(hashCode);
+        return;
       }
-      gotoEvents();
+      // 商品が1つも無ければ、まず登録してもらう
+      if (!products.length) gotoProducts();
+      else gotoRegister();
     }).catch(function (err) {
       toast('起動エラー: ' + err.message, true);
     });
