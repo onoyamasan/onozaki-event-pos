@@ -188,13 +188,61 @@
     try { parsed = JSON.parse(decodeURIComponent(escape(atob(raw.replace(/\s/g, ''))))); }
     catch (e) { $('setup-msg').textContent = '接続コードの形式が正しくありません。'; return; }
     if (!parsed.url || !parsed.secret) { $('setup-msg').textContent = '接続コードの中身が不足しています。'; return; }
-    $('setup-msg').textContent = '確認しています…';
     var tmp = { url: parsed.url, secret: parsed.secret, deviceName: parsed.deviceName || 'iPad' };
-    var prev = cfg;
-    cfg = tmp;
-    callRelay('ping', {}).then(function () { return dbPut('config', tmp, 'main'); })
-      .then(function () { $('setup-msg').textContent = ''; toast('この端末を登録しました'); gotoEvents(); })
-      .catch(function (err) { cfg = prev; $('setup-msg').textContent = '登録できませんでした: ' + err.message; });
+    // 接続コードに必要な情報は全部入っているので、通信の確認は待たない。
+    // ここでオンラインを必須にすると、圏外の会場でセットアップ画面から先へ進めなくなる。
+    dbPut('config', tmp, 'main').then(function () {
+      cfg = tmp;
+      $('setup-msg').textContent = '';
+      $('setup-code').value = '';
+      toast('この端末を登録しました');
+      gotoEvents();
+      // オンラインなら念のため疎通だけ裏で確かめる（失敗しても登録は消さない）
+      if (navigator.onLine) {
+        callRelay('ping', {}).catch(function () {
+          toast('登録はできましたが、いま接続を確認できませんでした', true);
+        });
+      }
+    }).catch(function (err) {
+      $('setup-msg').textContent = '登録できませんでした: ' + err.message;
+    });
+  }
+
+  /** 接続コードを作り直す。別の端末やホーム画面アプリへ移すときに使う。 */
+  function currentSetupCode() {
+    if (!cfg) return '';
+    return btoa(unescape(encodeURIComponent(JSON.stringify({
+      url: cfg.url, secret: cfg.secret, deviceName: cfg.deviceName
+    }))));
+  }
+
+  function showSetupCode() {
+    var code = currentSetupCode();
+    if (!code) return;
+    var box = document.createElement('div');
+    box.innerHTML = ''
+      + '<div class="muted" style="line-height:1.8;margin-bottom:12px;">'
+      + 'ホーム画面に追加したアプリや別のiPadで登録するときに、この文字列を貼り付けてください。<br>'
+      + '<b>iPadの「メモ」に控えておくと、圏外の会場でも登録できます。</b></div>'
+      + '<textarea id="sc-text" class="field" rows="5" readonly style="font-family:monospace;font-size:12px;word-break:break-all;">' + esc(code) + '</textarea>'
+      + '<button id="sc-copy" class="btn btn-primary" style="width:100%;margin-top:12px;">コピーする</button>'
+      + '<div class="muted" style="margin-top:12px;line-height:1.7;">'
+      + '※ これは合言葉を含みます。社外に出さないでください。</div>';
+    overlay({ title: '接続コード', bodyEl: box, hideOk: true, cancelLabel: '閉じる' });
+    $('sc-copy').onclick = function () {
+      var ta = $('sc-text');
+      ta.removeAttribute('readonly');
+      ta.select(); ta.setSelectionRange(0, 999999);
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { }
+      ta.setAttribute('readonly', '');
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(code).then(function () { toast('コピーしました'); },
+          function () { toast(ok ? 'コピーしました' : '長押しで選択してコピーしてください', !ok); });
+      } else {
+        toast(ok ? 'コピーしました' : '長押しで選択してコピーしてください', !ok);
+      }
+    };
   }
 
   function consumeSetupHash() {
@@ -985,6 +1033,7 @@
     $('m-events').onclick = gotoEvents;
     $('m-prod').onclick = function () { if (cur) gotoProducts(); };
     $('m-reg').onclick = function () { if (cur) gotoRegister(); };
+    $('menu-code').onclick = showSetupCode;
     $('menu-reset').onclick = function () {
       pendingTxns().then(function (p) {
         var msg = p.length

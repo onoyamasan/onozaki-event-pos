@@ -118,11 +118,16 @@
 <div id="s-setup" class="screen">
   <div class="card" style="max-width:520px;margin:40px auto;">
     <div class="h1">端末セットアップ</div>
-    <div class="muted" style="margin:8px 0 20px;line-height:1.7;">
-      kintoneから受け取った<b>接続コード</b>を貼り付けてください。<br>この端末に一度だけ保存されます。
+    <div class="muted" style="margin:8px 0 16px;line-height:1.7;">
+      <b>接続コード</b>を貼り付けてください。この端末に一度だけ保存されます。<br>
+      <b style="color:#1B5E20;">電波が無くても登録できます。</b>
     </div>
     <textarea id="setup-code" rows="4" placeholder="接続コードを貼り付け" class="field" style="font-family:monospace;font-size:14px;"></textarea>
     <button id="setup-go" class="btn btn-primary" style="width:100%;margin-top:14px;">この端末を登録する</button>
+    <div class="muted" style="margin-top:14px;line-height:1.7;border-top:1px solid #eee;padding-top:14px;">
+      接続コードが手元に無いときは、登録済みのアプリの<br>
+      ［メニュー］→［接続コードを表示］からコピーできます。
+    </div>
     <div id="setup-msg" class="muted" style="margin-top:12px;text-align:center;min-height:20px;"></div>
   </div>
 </div>
@@ -220,6 +225,7 @@
     <div class="card">
       <div style="font-weight:bold;color:#1B4F72;margin-bottom:10px;">この端末</div>
       <div id="menu-device" class="muted" style="line-height:1.8;margin-bottom:12px;"></div>
+      <button id="menu-code" class="btn btn-light" style="width:100%;margin-bottom:8px;">接続コードを表示</button>
       <button id="menu-reset" class="btn btn-light" style="width:100%;color:#B8432D;border-color:#F3C9BE;">端末登録を解除</button>
     </div>
   </div>
