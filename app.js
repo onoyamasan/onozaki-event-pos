@@ -368,8 +368,9 @@
           products: [], dailyBudget: [], createdAt: new Date().toISOString()
         };
         dbPut('events', rec).then(loadEvents).then(function () {
+          return setCurrent(rec);
+        }).then(function () {
           closeOverlay();
-          cur = rec;
           gotoProducts();     // 商品が無いので、そのまま登録画面へ
         });
       }
@@ -377,11 +378,21 @@
     setTimeout(function () { $('ne-name').focus(); }, 100);
   }
 
-  function openEvent(localId) {
-    cur = events.filter(function (e) { return e.localId === localId; })[0];
-    if (!cur) { gotoEvents(); return; }
+  /**
+   * 「いま開いているイベント」を覚える。
+   * これを保存しておかないと、アプリを開き直したときにレジではなく
+   * イベント一覧に戻ってしまう（圏外の現場でこれをやると事故る）。
+   */
+  function setCurrent(e) {
+    cur = e;
     cart = {};
-    dbPut('config', localId, 'currentEvent');
+    return dbPut('config', e ? e.localId : null, 'currentEvent');
+  }
+
+  function openEvent(localId) {
+    var e = events.filter(function (x) { return x.localId === localId; })[0];
+    if (!e) { gotoEvents(); return; }
+    setCurrent(e);
     if (!cur.products.length) gotoProducts();
     else gotoRegister();
   }
@@ -1001,9 +1012,16 @@
         if (hashCode) applySetupCode(hashCode);
         return;
       }
+      // 前回開いていたイベントがあればレジを直接開く。
+      // 覚えていなくてもイベントが1つだけならそれを開く（現場でタップを増やさない）。
       var last = events.filter(function (e) { return e.localId === r[1]; })[0];
-      if (last) { cur = last; gotoRegister(); }
-      else gotoEvents();
+      if (!last && events.length === 1) last = events[0];
+      if (last) {
+        cur = last;
+        if (last.products.length) gotoRegister(); else gotoProducts();
+      } else {
+        gotoEvents();
+      }
     }).catch(function (err) {
       toast('起動エラー: ' + err.message, true);
     });
