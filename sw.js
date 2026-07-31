@@ -4,7 +4,7 @@
  * 中身を更新したら CACHE 名の版数を必ず上げること。
  * 上げ忘れると iPad 側に古い画面が残り続ける。
  */
-var CACHE = 'onozaki-event-pos-v4';
+var CACHE = 'onozaki-event-pos-v5';
 var ASSETS = [
   './',
   './index.html',

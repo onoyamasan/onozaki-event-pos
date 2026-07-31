@@ -386,7 +386,17 @@
   function setCurrent(e) {
     cur = e;
     cart = {};
+    saveCart();
     return dbPut('config', e ? e.localId : null, 'currentEvent');
+  }
+
+  /**
+   * カートの途中経過も端末に保存する。
+   * iPadは裏に回したアプリをメモリ不足で終了させることがあり、
+   * 保存していないとお客さんの目の前でカートが消える。
+   */
+  function saveCart() {
+    return dbPut('config', { ev: cur ? cur.localId : null, items: cart }, 'cart').catch(function () { });
   }
 
   function openEvent(localId) {
@@ -584,6 +594,7 @@
     $('cart-total').innerHTML = '合計 <span class="num" style="font-size:26px;font-weight:bold;color:#D4573B;">' + yen(t) + '</span>';
     $('pay-cash').disabled = (t <= 0);
     $('pay-paypay').disabled = (t <= 0);
+    saveCart();
   }
 
   /** 本日の目標。kintone由来なら日別目標→商品予算、それも無ければ手入力値。 */
@@ -1003,9 +1014,10 @@
     var hashCode = consumeSetupHash();
 
     return openDb().then(function () {
-      return Promise.all([dbGet('config', 'main'), dbGet('config', 'currentEvent'), loadEvents()]);
+      return Promise.all([dbGet('config', 'main'), dbGet('config', 'currentEvent'), loadEvents(), dbGet('config', 'cart')]);
     }).then(function (r) {
       cfg = r[0];
+      var savedCart = r[3];
       renderPending();
       if (!cfg) {
         show('s-setup');
@@ -1018,6 +1030,12 @@
       if (!last && events.length === 1) last = events[0];
       if (last) {
         cur = last;
+        // アプリが落ちる前のカートを復元する（同じイベントのものだけ）
+        if (savedCart && savedCart.ev === last.localId && savedCart.items) {
+          cart = savedCart.items;
+          var n = Object.keys(cart).length;
+          if (n) setTimeout(function () { toast('会計途中のカートを復元しました'); }, 900);
+        }
         if (last.products.length) gotoRegister(); else gotoProducts();
       } else {
         gotoEvents();
