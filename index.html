@@ -139,10 +139,11 @@
     <div class="muted" style="margin-bottom:14px;line-height:1.7;">
       レジを開くイベントを選んでください。<b>電波が無くても、ここまでは動きます。</b>
     </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px;">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
       <button id="ev-pull" class="btn btn-primary">kintoneから取り込む</button>
       <button id="ev-new" class="btn btn-light">この場で作る</button>
     </div>
+    <button id="ev-import" class="btn btn-light" style="width:100%;margin-bottom:16px;font-size:14px;padding:11px;">コードからイベントを復元（圏外でも可）</button>
     <div id="ev-pull-note" class="muted" style="margin-bottom:14px;line-height:1.7;"></div>
     <div class="card" style="padding:0;"><div id="ev-list"></div></div>
   </div>
@@ -216,6 +217,7 @@
       <button id="m-send" class="menu-item"><span>kintone に送信</span><span id="m-send-sub" class="sub"></span></button>
       <button id="m-events" class="menu-item"><span>イベントを選ぶ</span><span id="m-events-sub" class="sub"></span></button>
       <button id="m-prod" class="menu-item"><span>商品の登録・編集</span><span id="m-prod-sub" class="sub"></span></button>
+      <button id="m-evcode" class="menu-item"><span>このイベントの持ち出しコード</span><span class="sub">メモに控える ›</span></button>
       <button id="m-reg" class="menu-item"><span>レジに戻る</span><span class="sub">›</span></button>
     </div>
     <div class="card" style="margin-bottom:16px;">

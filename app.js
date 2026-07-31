@@ -142,23 +142,60 @@
   // ─────────────────────────────────────────────
   //  通信
   // ─────────────────────────────────────────────
-  function callRelay(action, payload) {
+  /**
+   * 中継サーバを呼ぶ。必ずタイムアウトを付けること。
+   * 電波が弱いと fetch は何分でも待ち続けるので、
+   * 付けないと「読み込み中…」のまま現場で固まる。
+   */
+  function callRelay(action, payload, timeoutMs) {
     if (!cfg) return Promise.reject(new Error('端末が未登録です'));
     var body = Object.assign({ secret: cfg.secret, action: action }, payload || {});
+    var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timedOut = false;
+    var timer = setTimeout(function () {
+      timedOut = true;
+      if (ctl) ctl.abort();
+    }, timeoutMs || 20000);
+
     return fetch(cfg.url, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(body),
-      redirect: 'follow'
+      redirect: 'follow',
+      signal: ctl ? ctl.signal : undefined
     }).then(function (r) {
       if (!r.ok) throw new Error('通信エラー (HTTP ' + r.status + ')');
       return r.json();
     }).then(function (j) {
       if (!j.ok) throw new Error(j.error || '不明なエラー');
       return j;
+    }).catch(function (e) {
+      throw timedOut ? new Error('電波が届かないため時間切れになりました') : e;
+    }).then(function (v) {
+      clearTimeout(timer); return v;
+    }, function (e) {
+      clearTimeout(timer); throw e;
     });
   }
-  function isNetErr(e) { return /Failed to fetch|NetworkError|Load failed|通信エラー/i.test(e.message || ''); }
+  function isNetErr(e) {
+    return /Failed to fetch|NetworkError|Load failed|通信エラー|時間切れ|abort/i.test(e.message || '');
+  }
+
+  // ── イベントの持ち出し／復元（圏外でも移せるようにするため）
+  function encodePack(obj) { return btoa(unescape(encodeURIComponent(JSON.stringify(obj)))); }
+  function decodePack(s) { return JSON.parse(decodeURIComponent(escape(atob(s.replace(/\s/g, ''))))); }
+
+  function eventExportCode(e) {
+    return 'EV1:' + encodePack({
+      eventNo: e.eventNo, name: e.name, accountDept: e.accountDept,
+      startDate: e.startDate, endDate: e.endDate,
+      budgetSales: e.budgetSales, manualTarget: e.manualTarget,
+      dailyBudget: e.dailyBudget || [],
+      products: (e.products || []).map(function (p) {
+        return { name: p.name, price: p.price, cost: p.cost, tax: p.tax, budgetQty: p.budgetQty };
+      })
+    });
+  }
 
   function renderNet() {
     var on = navigator.onLine;
@@ -229,20 +266,7 @@
       + '<div class="muted" style="margin-top:12px;line-height:1.7;">'
       + '※ これは合言葉を含みます。社外に出さないでください。</div>';
     overlay({ title: '接続コード', bodyEl: box, hideOk: true, cancelLabel: '閉じる' });
-    $('sc-copy').onclick = function () {
-      var ta = $('sc-text');
-      ta.removeAttribute('readonly');
-      ta.select(); ta.setSelectionRange(0, 999999);
-      var ok = false;
-      try { ok = document.execCommand('copy'); } catch (e) { }
-      ta.setAttribute('readonly', '');
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(code).then(function () { toast('コピーしました'); },
-          function () { toast(ok ? 'コピーしました' : '長押しで選択してコピーしてください', !ok); });
-      } else {
-        toast(ok ? 'コピーしました' : '長押しで選択してコピーしてください', !ok);
-      }
-    };
+    $('sc-copy').onclick = function () { copyFrom('sc-text', code); };
   }
 
   function consumeSetupHash() {
@@ -445,6 +469,81 @@
    */
   function saveCart() {
     return dbPut('config', { ev: cur ? cur.localId : null, items: cart }, 'cart').catch(function () { });
+  }
+
+  /** いま開いているイベントを、別のアプリ／端末へ移すためのコードを出す。 */
+  function showEventCode() {
+    if (!cur) { toast('先にイベントを開いてください', true); return; }
+    var code = eventExportCode(cur);
+    var box = document.createElement('div');
+    box.innerHTML = ''
+      + '<div class="muted" style="line-height:1.8;margin-bottom:12px;">'
+      + '<b>' + esc(cur.name) + '</b>（商品' + cur.products.length + '件）を移すためのコードです。<br>'
+      + '<b>iPadの「メモ」に控えておけば、圏外でも復元できます。</b></div>'
+      + '<textarea id="ec-text" class="field" rows="6" readonly style="font-family:monospace;font-size:11px;word-break:break-all;">' + esc(code) + '</textarea>'
+      + '<button id="ec-copy" class="btn btn-primary" style="width:100%;margin-top:12px;">コピーする</button>';
+    overlay({ title: 'イベントの持ち出しコード', bodyEl: box, hideOk: true, cancelLabel: '閉じる' });
+    $('ec-copy').onclick = function () { copyFrom('ec-text', code); };
+  }
+
+  /** 持ち出しコードからイベントを復元する（通信なし）。 */
+  function importEventDialog() {
+    var box = document.createElement('div');
+    box.innerHTML = ''
+      + '<div class="muted" style="line-height:1.8;margin-bottom:12px;">'
+      + '「メモ」に控えた<b>イベントの持ち出しコード</b>を貼り付けてください。<br>'
+      + '<b style="color:#1B5E20;">電波が無くても復元できます。</b></div>'
+      + '<textarea id="ei-text" class="field" rows="5" placeholder="EV1:… で始まるコード" style="font-family:monospace;font-size:12px;"></textarea>';
+    overlay({
+      title: 'コードからイベントを復元', bodyEl: box, okLabel: '復元する',
+      onOk: function () {
+        var raw = ($('ei-text').value || '').trim();
+        if (!raw) return;
+        var d;
+        try {
+          d = decodePack(raw.replace(/^EV1:/, ''));
+          if (!d || !d.name) throw new Error('中身が不足しています');
+        } catch (e) { toast('コードの形式が正しくありません', true); return; }
+
+        var exist = d.eventNo ? events.filter(function (x) { return x.eventNo === d.eventNo; })[0] : null;
+        var rec = {
+          localId: exist ? exist.localId : uuid(),
+          eventNo: d.eventNo || null,
+          source: d.eventNo ? 'kintone' : 'local',
+          name: d.name, accountDept: d.accountDept || '',
+          startDate: d.startDate || '', endDate: d.endDate || '',
+          budgetSales: d.budgetSales || 0, manualTarget: d.manualTarget || 0,
+          dailyBudget: d.dailyBudget || [],
+          products: (d.products || []).map(function (p, i) {
+            return { id: uuid(), name: p.name, price: p.price, cost: p.cost || 0, tax: p.tax || '8%', budgetQty: p.budgetQty || 0, sort: i };
+          }),
+          createdAt: exist ? exist.createdAt : new Date().toISOString()
+        };
+        dbPut('events', rec).then(loadEvents).then(function () { return setCurrent(rec); })
+          .then(function () {
+            closeOverlay();
+            toast('「' + rec.name + '」を復元しました（商品' + rec.products.length + '件）');
+            if (rec.products.length) gotoRegister(); else gotoProducts();
+          });
+      }
+    });
+    setTimeout(function () { $('ei-text').focus(); }, 100);
+  }
+
+  /** テキストエリアの中身をコピーする（iPadでも動くように execCommand も併用） */
+  function copyFrom(id, text) {
+    var ta = $(id);
+    ta.removeAttribute('readonly');
+    ta.select(); ta.setSelectionRange(0, 999999);
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { }
+    ta.setAttribute('readonly', '');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { toast('コピーしました'); },
+        function () { toast(ok ? 'コピーしました' : '長押しで選択してコピーしてください', !ok); });
+    } else {
+      toast(ok ? 'コピーしました' : '長押しで選択してコピーしてください', !ok);
+    }
   }
 
   function openEvent(localId) {
@@ -988,6 +1087,7 @@
     $('m-events-sub').textContent = events.length + '件 ›';
     $('m-prod-sub').textContent = cur ? (cur.products.length + '品目 ›') : '－';
     $('m-prod').disabled = !cur;
+    $('m-evcode').style.display = cur ? '' : 'none';
     $('m-reg').style.display = cur ? '' : 'none';
 
     dbAll('txns').then(function (all) {
@@ -1022,6 +1122,7 @@
     };
     $('ev-pull').onclick = pullEvents;
     $('ev-new').onclick = newEventDialog;
+    $('ev-import').onclick = importEventDialog;
     $('np-add').onclick = addProduct;
     $('np-price').addEventListener('keydown', function (e) { if (e.key === 'Enter') addProduct(); });
     $('np-copy').onclick = copyProductsDialog;
@@ -1034,6 +1135,7 @@
     $('m-prod').onclick = function () { if (cur) gotoProducts(); };
     $('m-reg').onclick = function () { if (cur) gotoRegister(); };
     $('menu-code').onclick = showSetupCode;
+    $('m-evcode').onclick = showEventCode;
     $('menu-reset').onclick = function () {
       pendingTxns().then(function (p) {
         var msg = p.length
